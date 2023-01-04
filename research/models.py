@@ -3,6 +3,51 @@ from torchlibrosa.augmentation import SpecAugmentation
 import torch.nn as nn
 import torch 
 import torch.nn.functional as F
+from pytorch_utils import do_mixup, interpolate, pad_framewise_output, forward
+from sklearn import metrics
+from torchmetrics.classification import MulticlassPrecisionRecallCurve, Precision, Recall
+
+def get_default_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+device=get_default_device()
+
+class AudioClassificationBase(nn.Module):
+    def training_step(self, batch):
+        images, labels = batch
+        out = self(images)['clipwise_output']                    
+
+        loss = F.cross_entropy(out, labels) 
+        return loss
+
+    def validation_step(self, batch):
+            images, labels = batch
+            out = self(images)['clipwise_output']                    
+            loss = F.cross_entropy(out, labels)   
+            acc = accuracy(out, labels)
+            
+            #metric = MulticlassPrecisionRecallCurve(num_classes=self.classes_num, thresholds=5).to(device)
+            #precision_recall_curve = metric(out, labels)
+
+            precision = Precision(task="multiclass", average='macro', num_classes=self.classes_num).to(device)
+            average_precision = precision(out, labels)
+
+            recall = Recall(task="multiclass", average='macro', num_classes=self.classes_num).to(device)(out, labels)
+
+            return {'val_loss': loss.detach(), 'val_acc': acc, 'average_precision': average_precision, 'average_recall': recall}
+            
+    def validation_epoch_end(self, outputs):
+            batch_losses = [x['val_loss'] for x in outputs]
+            epoch_loss = torch.stack(batch_losses).mean()   
+            batch_accs = [x['val_acc'] for x in outputs]
+            epoch_acc = torch.stack(batch_accs).mean()     
+            batch_average_precision = [x['average_precision'] for x in outputs]
+            epoch_average_precision = torch.stack(batch_average_precision).mean()     
+            batch_recall = [x['average_recall'] for x in outputs]
+            epoch_recall = torch.stack(batch_recall).mean()     
+            return {'val_loss': epoch_loss.item(), 'val_acc': epoch_acc.item(), 'average_precision': epoch_average_precision.item(), 'average_recall': epoch_recall.item()}
+
 
 def init_layer(layer):
     """Initialize a Linear or Convolutional layer. """
@@ -61,14 +106,14 @@ class ConvBlock(nn.Module):
         else:
             raise Exception('Incorrect argument!')
         
-        return 
+        return x
 
-class Cnn14(nn.Module):
+class Cnn10(AudioClassificationBase):
     def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
         fmax, classes_num):
         
-        super(Cnn14, self).__init__()
-
+        super(Cnn10, self).__init__()
+        self.classes_num = classes_num
         window = 'hann'
         center = True
         pad_mode = 'reflect'
@@ -96,11 +141,9 @@ class Cnn14(nn.Module):
         self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
         self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
         self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
-        self.conv_block5 = ConvBlock(in_channels=512, out_channels=1024)
-        self.conv_block6 = ConvBlock(in_channels=1024, out_channels=2048)
 
-        self.fc1 = nn.Linear(2048, 2048, bias=True)
-        self.fc_audioset = nn.Linear(2048, classes_num, bias=True)
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
         
         self.init_weight()
 
@@ -115,7 +158,7 @@ class Cnn14(nn.Module):
 
         x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
         x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
-
+        
         x = x.transpose(1, 3)
         x = self.bn0(x)
         x = x.transpose(1, 3)
@@ -124,9 +167,9 @@ class Cnn14(nn.Module):
             x = self.spec_augmenter(x)
 
         # Mixup on spectrogram
-        #if self.training and mixup_lambda is not None:
-        #    x = do_mixup(x, mixup_lambda)
-
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
         x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
         x = F.dropout(x, p=0.2, training=self.training)
         x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
@@ -134,10 +177,6 @@ class Cnn14(nn.Module):
         x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
         x = F.dropout(x, p=0.2, training=self.training)
         x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
-        x = F.dropout(x, p=0.2, training=self.training)
-        x = self.conv_block5(x, pool_size=(2, 2), pool_type='avg')
-        x = F.dropout(x, p=0.2, training=self.training)
-        x = self.conv_block6(x, pool_size=(1, 1), pool_type='avg')
         x = F.dropout(x, p=0.2, training=self.training)
         x = torch.mean(x, dim=3)
         
@@ -153,12 +192,15 @@ class Cnn14(nn.Module):
 
         return output_dict
 
-class MobileNetV1(nn.Module):
+def accuracy(outputs, labels):
+    _, preds = torch.max(outputs, dim=1)
+    return torch.tensor(torch.sum(preds == labels).item() / len(preds))
+
+class MobileNetV1(AudioClassificationBase):
     def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
         fmax, classes_num):
-        
-        super(MobileNetV1, self).__init__()
-
+        self.classes_num = classes_num
+        super().__init__()
         window = 'hann'
         center = True
         pad_mode = 'reflect'
@@ -167,11 +209,14 @@ class MobileNetV1(nn.Module):
         top_db = None
 
         # Spectrogram extractor
+        # (batch_size, 1, time_steps, freq_bins)
         self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
             win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
             freeze_parameters=True)
 
-        # Logmel feature extractor
+        # Logmel feature extractor      
+        # (batch_size, 1, time_steps, mel_bins)
+
         self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
             n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
             freeze_parameters=True)
@@ -265,6 +310,8 @@ class MobileNetV1(nn.Module):
         output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
         """(classes_num,)"""
         return output_dict
+
+
 
 class MobileNetV1Export(MobileNetV1):
     def __init__(self, *args, **kwargs):
